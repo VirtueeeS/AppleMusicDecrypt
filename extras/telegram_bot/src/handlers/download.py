@@ -1,4 +1,5 @@
-import asyncio
+import uuid
+
 from tabulate import tabulate
 
 from telegram import Update
@@ -10,8 +11,9 @@ from creart import it
 from extras.telegram_bot.src.auth import check_auth
 from extras.telegram_bot.src.config import bot_config
 from extras.telegram_bot.src.db import user_db
-from extras.telegram_bot.src.handlers.notifications import telegram_tasks_listeners
-from extras.telegram_bot.src.upload import UploadTask, check_disk_space
+from extras.telegram_bot.src.handlers.notifications import send_job_summary
+from extras.telegram_bot.src.models import BotJob, BotJobResult, SongProcessResult
+from extras.telegram_bot.src.queue import QueueFullError
 
 from src.api import WebAPI
 from src.config import Config
@@ -19,36 +21,66 @@ from src.flags import Flags
 from src.grpc.manager import WrapperManager
 from src.metadata import SongMetadata
 from src.task import Status
-from src.types import ParentDoneHandler, Codec
 from src.url import AppleMusicURL, URLType, Song
-from src.utils import get_codec_from_codec_id, safely_create_task, playlist_write_song_index
+from src.utils import get_codec_from_codec_id, playlist_write_song_index
+
+
+SUPPORTED_CODECS = ["alac", "ec3", "aac", "aac-binaural", "aac-downmix", "aac-legacy", "ac3"]
+
+
+def _resolve_language_code(telegram_language: str | None, fallback: str) -> str:
+    lang_map = {
+        "zh-hans": "zh-Hans-CN",
+        "zh-hant": "zh-Hant-TW",
+        "en": "en-US",
+    }
+    if not telegram_language:
+        return fallback
+    return lang_map.get(telegram_language.lower(), telegram_language)
+
+
+def _parse_dl_args(args: list[str]):
+    force_download = False
+    codec_override = None
+    url_str = None
+
+    i = 0
+    while i < len(args):
+        if args[i] == '-f':
+            force_download = True
+            i += 1
+        elif args[i] == '-c':
+            if i + 1 >= len(args):
+                raise ValueError('Missing codec value after -c')
+            codec_override = args[i + 1]
+            i += 2
+        else:
+            url_str = args[i]
+            i += 1
+
+    if not url_str:
+        raise ValueError('Missing Apple Music URL.')
+    return force_download, codec_override, url_str
 
 
 @check_auth
 async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ripper = context.bot_data.get("ripper")
-    if not ripper:
+    queue = context.bot_data.get('job_queue')
+    if not queue:
+        await update.message.reply_text('队列尚未初始化。')
         return
 
-    chat_id = update.effective_chat.id
-    active_ids = []
-    for k, v in telegram_tasks_listeners.items():
-        if any(listener["chat_id"] == chat_id for listener in v):
-            active_ids.append(k)
-
-    tasks_str = []
-    for track_id in active_ids:
-        t = ripper.download_manager.get_task(track_id)
-        if t:
-            title = t.metadata.title if t.metadata else 'Unknown'
-            tasks_str.append(f"- [{track_id[-4:]}] {title}: {t.status.value}")
-
-    if not tasks_str:
-        await update.message.reply_text("No active tasks for you.")
-        return
-
-    text = "Your Active Tasks:\n" + "\n".join(tasks_str)
-    await update.message.reply_text(text)
+    current, pending = queue.describe_user(update.effective_user.id)
+    lines = []
+    if current:
+        lines.append(f'当前执行：{current.request_type} {current.request_url}')
+    if pending:
+        lines.append('排队中的任务：')
+        for index, job in enumerate(pending, start=1):
+            lines.append(f'- 第 {index} 位：{job.request_type} {job.request_url}')
+    if not lines:
+        lines.append('你当前没有排队中的任务。')
+    await update.message.reply_text('\n'.join(lines))
 
 
 @check_auth
@@ -57,30 +89,30 @@ async def quality_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         codecs = it(Config).download.codecPriority
         await update.message.reply_text(
             f"Available system codecs: {', '.join(codecs)}\n\nUsage to inspect a song: `/quality <url>`",
-            parse_mode="Markdown")
+            parse_mode='Markdown')
         return
 
     raw_url = context.args[0]
     url_obj = AppleMusicURL.parse_url(raw_url)
     if not url_obj or url_obj.type != URLType.Song:
-        await update.message.reply_text("Please provide a valid single Apple Music Song URL.")
+        await update.message.reply_text('Please provide a valid single Apple Music Song URL.')
         return
 
-    msg = await update.message.reply_text("Fetching audio qualities...")
+    msg = await update.message.reply_text('Fetching audio qualities...')
     try:
         user_settings = await user_db.get_user_settings(update.effective_user.id)
-        language = user_settings.get("language", bot_config.user_default.language)
-        if language == "follow-user":
+        language = user_settings.get('language', bot_config.user_default.language)
+        if language == 'follow-user':
             language = update.effective_user.language_code or it(Config).region.language
 
         m3u8_url = await it(WrapperManager).m3u8(url_obj.id)
         if not m3u8_url:
-            await msg.edit_text("Failed to get M3U8 URL from WrapperManager.")
+            await msg.edit_text('Failed to get M3U8 URL from WrapperManager.')
             return
 
         raw_metadata = await it(WebAPI).get_song_info(url_obj.id, url_obj.storefront, language)
         if not raw_metadata:
-            await msg.edit_text("Failed to fetch song metadata.")
+            await msg.edit_text('Failed to fetch song metadata.')
             return
 
         metadata = SongMetadata.parse_from_song_data(raw_metadata)
@@ -93,382 +125,191 @@ async def quality_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if codec:
                 codec_id = playlist.stream_info.audio
                 bitrate = playlist.stream_info.bandwidth
-                average_bitrate = getattr(playlist.stream_info, "average_bandwidth", None)
+                average_bitrate = getattr(playlist.stream_info, 'average_bandwidth', None)
                 channels = playlist.media[0].channels if playlist.media else None
-                sample_rate = playlist.media[0].extras.get("sample_rate", None) if playlist.media else None
-                bit_depth = playlist.media[0].extras.get("bit_depth", None) if playlist.media else None
+                sample_rate = playlist.media[0].extras.get('sample_rate', None) if playlist.media else None
+                bit_depth = playlist.media[0].extras.get('bit_depth', None) if playlist.media else None
                 table_data.append([codec_id, codec, bitrate, average_bitrate, channels, sample_rate, bit_depth])
 
         if not table_data:
-            await msg.edit_text("No playable audio tracks found in M3U8.")
+            await msg.edit_text('No playable audio tracks found in M3U8.')
             return
 
-        table_str = tabulate(table_data, headers=headers, tablefmt="presto")
+        table_str = tabulate(table_data, headers=headers, tablefmt='presto')
         title_text = f"Available audio qualities for song: {metadata.artist} - {metadata.title}\n"
-        await msg.edit_text(f"{title_text}```text\n{table_str}\n```", parse_mode="Markdown")
+        await msg.edit_text(f"{title_text}```text\n{table_str}\n```", parse_mode='Markdown')
 
     except Exception as e:
-        await msg.edit_text(f"Error checking quality: {str(e)}")
+        await msg.edit_text(f'Error checking quality: {str(e)}')
 
 
 @check_auth
 async def dl_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: `/dl <url> [-f] [-c codec]`", parse_mode="Markdown")
+    try:
+        force_download, codec_override, raw_url = _parse_dl_args(context.args)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
         return
 
-    force_download = False
-    codec_override = None
-    url_str = None
-
-    i = 0
-    while i < len(args):
-        if args[i] == '-f':
-            force_download = True
-            i += 1
-        elif args[i] == '-c':
-            if i + 1 < len(args):
-                codec_override = args[i + 1]
-                i += 2
-            else:
-                await update.message.reply_text("Missing codec value after `-c`", parse_mode="Markdown")
-                return
-        else:
-            url_str = args[i]
-            i += 1
-
-    if not url_str:
-        await update.message.reply_text("Missing Apple Music URL.")
-        return
-
-    raw_url = url_str
     url_obj = AppleMusicURL.parse_url(raw_url)
     if not url_obj:
-        await update.message.reply_text("Invalid Apple Music URL.")
+        await update.message.reply_text('Invalid Apple Music URL.')
         return
 
     if url_obj.type.lower() not in bot_config.limits.allowed_types:
-        await update.message.reply_text(
-            f"Error: Downloading {url_obj.type} is disabled by the limits config.")
+        await update.message.reply_text(f'Error: Downloading {url_obj.type} is disabled by the limits config.')
         return
-
-    msg = await update.message.reply_text(f"Fetching {url_obj.type} metadata...")
 
     user_settings = await user_db.get_user_settings(update.effective_user.id)
-    codec = codec_override if codec_override else user_settings.get("default_codec",
-                                                                    bot_config.user_default.default_codec)
-    SUPPORTED_CODECS = ["alac", "ec3", "aac", "aac-binaural", "aac-downmix", "aac-legacy", "ac3"]
-    if codec.lower() not in SUPPORTED_CODECS:
-        await update.message.reply_text(f"Invalid codec `{codec}`. Available: {', '.join(SUPPORTED_CODECS)}",
-                                        parse_mode="Markdown")
-        return
-    codec = codec.lower()
-
-    language = user_settings.get("language", bot_config.user_default.language)
-    if language == "follow-user":
-        tg_lang = update.effective_user.language_code
-        lang_map = {
-            "zh-hans": "zh-Hans-CN",
-            "zh-hant": "zh-Hant-TW",
-            "en": "en-US"
-        }
-        language = lang_map.get(tg_lang.lower(), tg_lang) if tg_lang else it(Config).region.language
-
-    loose_cache = bot_config.system.loose_cache
-
-    if not check_disk_space(5 * 1024 * 1024 * 1024):
-        await update.message.reply_text("Error: Request rejected. Bot server has less than 5GB of free disk space.")
-        for admin_id in bot_config.system.admin_ids:
-            try:
-                await context.bot.send_message(chat_id=admin_id,
-                                               text="CRITICAL: Disk space has dropped below safety threshold (< 5GB). Please clean up!")
-            except Exception:
-                pass
+    codec = (codec_override or user_settings.get('default_codec', bot_config.user_default.default_codec)).lower()
+    if codec not in SUPPORTED_CODECS:
+        await update.message.reply_text(f"Invalid codec `{codec}`. Available: {', '.join(SUPPORTED_CODECS)}", parse_mode='Markdown')
         return
 
-    # Check Global and User Quotas
-    current_global_tasks = 0
-    current_user_tasks = 0
-    user_id = update.effective_user.id
-    for song_id, listeners in telegram_tasks_listeners.items():
-        if listeners:
-            current_global_tasks += 1
-            if any(l["chat_id"] == update.effective_chat.id for l in listeners):  # Use chat_id loosely as user isolation here
-                current_user_tasks += 1
+    language = user_settings.get('language', bot_config.user_default.language)
+    if language == 'follow-user':
+        language = _resolve_language_code(update.effective_user.language_code, it(Config).region.language)
 
-    if current_global_tasks >= bot_config.limits.max_tasks_global:
-        await msg.edit_text(
-            f"Error: Global task limit reached ({bot_config.limits.max_tasks_global}). Please try again later.")
+    queue = context.bot_data.get('job_queue')
+    if not queue:
+        await update.message.reply_text('队列尚未初始化。')
         return
 
-    if current_user_tasks >= bot_config.limits.max_tasks_per_user:
-        await msg.edit_text(
-            f"Error: Your personal task limit reached ({bot_config.limits.max_tasks_per_user}). Please wait for your current tasks to finish.")
+    job = BotJob(
+        job_id=uuid.uuid4().hex,
+        user_id=update.effective_user.id,
+        chat_id=update.effective_chat.id,
+        request_url=raw_url,
+        request_type=url_obj.type,
+        codec=codec,
+        language=language,
+        force_download=force_download,
+        reply_message_id=update.message.message_id,
+    )
+
+    try:
+        position = await queue.enqueue(job)
+    except QueueFullError:
+        await update.message.reply_text('当前队列已满，请稍后再试。')
         return
 
+    await update.message.reply_text(
+        f'已加入队列\n任务类型：{job.request_type}\n当前排队位置：{position}',
+        reply_to_message_id=update.message.message_id,
+    )
+
+
+async def _collect_tracks(url_obj, language: str):
     songs_to_rip = []
-
-    # Pre-flight Check Length & Size Limits
     if url_obj.type == URLType.Song:
-        try:
-            song_info = await it(WebAPI).get_song_info(url_obj.id, url_obj.storefront, language)
-            if song_info and song_info.data:
-                duration_ms = song_info.data[0].attributes.durationInMillis
-                duration_sec = duration_ms / 1000
-                if duration_sec > bot_config.limits.max_song_duration_sec:
-                    await msg.edit_text(
-                        f"Error: Song duration ({duration_sec}s) exceeds the limit of {bot_config.limits.max_song_duration_sec}s.")
-                    return
-
-                estimated_bytes = duration_sec * 375 * 1024
-                if estimated_bytes > 1.95 * 1024 ** 3:
-                    await msg.edit_text(
-                        f"Estimated file size ({estimated_bytes / 1024 ** 3:.2f} GB) exceeds 1.95 GB limit. Task rejected.")
-                    return
-        except Exception:
-            pass
-        songs_to_rip.append((Song(id=url_obj.id, storefront=url_obj.storefront, url="", type=URLType.Song), None))
-
+        song_info = await it(WebAPI).get_song_info(url_obj.id, url_obj.storefront, language)
+        if song_info and song_info.data:
+            duration_sec = song_info.data[0].attributes.durationInMillis / 1000
+            if duration_sec > bot_config.limits.max_song_duration_sec:
+                raise ValueError(f'单曲时长 {duration_sec:.0f}s 超过限制 {bot_config.limits.max_song_duration_sec}s')
+        songs_to_rip.append((Song(id=url_obj.id, storefront=url_obj.storefront, url=url_obj.url, type=URLType.Song), None))
     elif url_obj.type == URLType.Album:
         album_info = await it(WebAPI).get_album_info(url_obj.id, url_obj.storefront, language)
-        if album_info and album_info.data:
-            tracks = album_info.data[0].relationships.tracks.data
-            if len(tracks) > bot_config.limits.max_tracks:
-                await msg.edit_text(
-                    f"Error: Album tracks ({len(tracks)}) exceeds the limit of {bot_config.limits.max_tracks}.")
-                return
-
-            total_duration_sec = sum(
-                [t.attributes.durationInMillis / 1000 for t in tracks if getattr(t.attributes, 'durationInMillis', 0)])
-            if total_duration_sec > bot_config.limits.max_total_duration_sec:
-                await msg.edit_text(
-                    f"Error: Album total duration ({total_duration_sec}s) exceeds the limit of {bot_config.limits.max_total_duration_sec}s.")
-                return
-
-            for track in tracks:
-                songs_to_rip.append((Song(id=track.id, storefront=url_obj.storefront, url="", type=URLType.Song), None))
-
+        tracks = album_info.data[0].relationships.tracks.data if album_info and album_info.data else []
+        if len(tracks) > bot_config.limits.max_tracks:
+            raise ValueError(f'专辑曲目数 {len(tracks)} 超过限制 {bot_config.limits.max_tracks}')
+        total_duration_sec = sum([t.attributes.durationInMillis / 1000 for t in tracks if getattr(t.attributes, 'durationInMillis', 0)])
+        if total_duration_sec > bot_config.limits.max_total_duration_sec:
+            raise ValueError(f'专辑总时长 {total_duration_sec:.0f}s 超过限制 {bot_config.limits.max_total_duration_sec}s')
+        for track in tracks:
+            songs_to_rip.append((Song(id=track.id, storefront=url_obj.storefront, url=f'https://music.apple.com/{url_obj.storefront}/song/{track.id}', type=URLType.Song), None))
     elif url_obj.type == URLType.Playlist:
         playlist_info = await it(WebAPI).get_playlist_info_and_tracks(url_obj.id, url_obj.storefront, language)
-        if playlist_info and playlist_info.data:
-            tracks = playlist_info.data[0].relationships.tracks.data
-            if len(tracks) > bot_config.limits.max_tracks:
-                await msg.edit_text(
-                    f"Error: Playlist tracks ({len(tracks)}) exceeds the limit of {bot_config.limits.max_tracks}.")
-                return
-
-            total_duration_sec = sum(
-                [t.attributes.durationInMillis / 1000 for t in tracks if getattr(t.attributes, 'durationInMillis', 0)])
-            if total_duration_sec > bot_config.limits.max_total_duration_sec:
-                await msg.edit_text(
-                    f"Error: Playlist total duration ({total_duration_sec}s) exceeds the limit of {bot_config.limits.max_total_duration_sec}s.")
-                return
-
-            playlist_info = playlist_write_song_index(playlist_info)
-            for track in playlist_info.data[0].relationships.tracks.data:
-                songs_to_rip.append(
-                    (Song(id=track.id, storefront=url_obj.storefront, url="", type=URLType.Song), playlist_info))
-
+        tracks = playlist_info.data[0].relationships.tracks.data if playlist_info and playlist_info.data else []
+        if len(tracks) > bot_config.limits.max_tracks:
+            raise ValueError(f'歌单曲目数 {len(tracks)} 超过限制 {bot_config.limits.max_tracks}')
+        total_duration_sec = sum([t.attributes.durationInMillis / 1000 for t in tracks if getattr(t.attributes, 'durationInMillis', 0)])
+        if total_duration_sec > bot_config.limits.max_total_duration_sec:
+            raise ValueError(f'歌单总时长 {total_duration_sec:.0f}s 超过限制 {bot_config.limits.max_total_duration_sec}s')
+        playlist_info = playlist_write_song_index(playlist_info)
+        for track in tracks:
+            songs_to_rip.append((Song(id=track.id, storefront=url_obj.storefront, url=f'https://music.apple.com/{url_obj.storefront}/song/{track.id}', type=URLType.Song), playlist_info))
     elif url_obj.type == URLType.Artist:
         artist_info = await it(WebAPI).get_artist_info(url_obj.id, url_obj.storefront, language)
-        if artist_info and artist_info.data:
-            albums = getattr(artist_info.data[0].relationships.albums, 'data', []) if getattr(
-                artist_info.data[0].relationships, 'albums', None) else []
-            all_tracks = []
-            for album in albums:
-                album_info = await it(WebAPI).get_album_info(album.id, url_obj.storefront, language)
-                if album_info and album_info.data:
-                    all_tracks.extend(album_info.data[0].relationships.tracks.data)
+        albums = getattr(artist_info.data[0].relationships.albums, 'data', []) if artist_info and artist_info.data and getattr(artist_info.data[0].relationships, 'albums', None) else []
+        all_tracks = []
+        for album in albums:
+            album_info = await it(WebAPI).get_album_info(album.id, url_obj.storefront, language)
+            if album_info and album_info.data:
+                all_tracks.extend(album_info.data[0].relationships.tracks.data)
+        if len(all_tracks) > bot_config.limits.max_tracks:
+            raise ValueError(f'艺术家曲目数 {len(all_tracks)} 超过限制 {bot_config.limits.max_tracks}')
+        total_duration_sec = sum([t.attributes.durationInMillis / 1000 for t in all_tracks if getattr(t.attributes, 'durationInMillis', 0)])
+        if total_duration_sec > bot_config.limits.max_total_duration_sec:
+            raise ValueError(f'艺术家总时长 {total_duration_sec:.0f}s 超过限制 {bot_config.limits.max_total_duration_sec}s')
+        for track in all_tracks:
+            songs_to_rip.append((Song(id=track.id, storefront=url_obj.storefront, url=f'https://music.apple.com/{url_obj.storefront}/song/{track.id}', type=URLType.Song), None))
+    return songs_to_rip
 
-            if len(all_tracks) > bot_config.limits.max_tracks:
-                await msg.edit_text(
-                    f"Error: Artist tracks ({len(all_tracks)}) exceeds the limit of {bot_config.limits.max_tracks}.")
-                return
 
-            total_duration_sec = sum([t.attributes.durationInMillis / 1000 for t in all_tracks if
-                                      getattr(t.attributes, 'durationInMillis', 0)])
-            if total_duration_sec > bot_config.limits.max_total_duration_sec:
-                await msg.edit_text(
-                    f"Error: Artist total duration ({total_duration_sec}s) exceeds the limit of {bot_config.limits.max_total_duration_sec}s.")
-                return
+def _task_to_song_result(task, fallback_song: Song) -> SongProcessResult:
+    if task is None:
+        return SongProcessResult(
+            song_id=fallback_song.id,
+            title=fallback_song.id,
+            artist='',
+            album='',
+            source_url=fallback_song.url,
+            status='failed',
+            error_message='任务未返回结果',
+        )
+    title = task.metadata.title if task.metadata else fallback_song.id
+    artist = task.metadata.artist if task.metadata else ''
+    album = task.metadata.album if task.metadata else ''
+    remote_dir = ''
+    remote_files = []
+    if task.upload_result:
+        remote_dir = task.upload_result.remote_dir
+        remote_files = [item.remote_path for item in task.upload_result.items if item.success]
+    elif task.saved_files:
+        remote_dir = task.saved_files.remote_dir
+    if task.status == Status.DONE:
+        return SongProcessResult(song_id=task.adamId, title=title, artist=artist, album=album, source_url=task.source_url or fallback_song.url, status='success', remote_dir=remote_dir, remote_files=remote_files)
+    return SongProcessResult(song_id=task.adamId, title=title, artist=artist, album=album, source_url=task.source_url or fallback_song.url, status='failed', error_message=str(task.error) if task.error else '未知错误', remote_dir=remote_dir, remote_files=remote_files)
 
-            for track in all_tracks:
-                songs_to_rip.append((Song(id=track.id, storefront=url_obj.storefront, url="", type=URLType.Song), None))
 
-    if not songs_to_rip:
-        await msg.edit_text("No tracks found or unsupported URL structure.")
+def _build_job_result(job: BotJob, song_results: list[SongProcessResult]) -> BotJobResult:
+    successful = [song for song in song_results if song.status == 'success']
+    failed = [song for song in song_results if song.status != 'success']
+    return BotJobResult(
+        job_id=job.job_id,
+        request_type=job.request_type,
+        request_url=job.request_url,
+        total_count=len(song_results),
+        success_count=len(successful),
+        failed_count=len(failed),
+        successful_songs=successful,
+        failed_songs=failed,
+    )
+
+
+async def process_bot_job(app, job: BotJob):
+    await app.bot.send_message(chat_id=job.chat_id, text='任务开始处理，请等待完成结果。', reply_to_message_id=job.reply_message_id)
+    url_obj = AppleMusicURL.parse_url(job.request_url)
+    if not url_obj:
+        result = BotJobResult(job_id=job.job_id, request_type=job.request_type, request_url=job.request_url, total_count=1, success_count=0, failed_count=1, failed_songs=[SongProcessResult(song_id='', title=job.request_url, artist='', album='', source_url=job.request_url, status='failed', error_message='链接无效')])
+        await send_job_summary(app.bot, job, result)
         return
 
-    req_delta = len(songs_to_rip)
-    if current_global_tasks + req_delta > bot_config.limits.max_tasks_global:
-        await msg.edit_text(
-            f"Error: Adding {req_delta} tasks would exceed the global limit ({bot_config.limits.max_tasks_global}).")
-        return
-
-    if current_user_tasks + req_delta > bot_config.limits.max_tasks_per_user:
-        await msg.edit_text(
-            f"Error: Adding {req_delta} tasks would exceed your personal limit ({bot_config.limits.max_tasks_per_user}).")
-        return
-
-    await msg.edit_text(f"Task passes limit verification. Added {req_delta} items.")
-
-    ripper = context.bot_data["ripper"]
-    upload_worker = context.bot_data["upload_worker"]
-
-    state = {
-        "tasks": {},
-        "last_text": "",
-        "done": False
-    }
-
-    async def update_loop():
-        try:
-            while not state["done"]:
-                await asyncio.sleep(4)
-                if not state["tasks"]:
-                    continue
-
-                # Update statuses cleanly
-                for track_id in list(state["tasks"].keys()):
-                    if "\u2728" in state["tasks"][track_id] or "\u26A1" in state["tasks"][track_id] or "\u2B06" in \
-                            state["tasks"][track_id] or "\u274C" in state["tasks"][track_id] or "Finished" in state["tasks"][track_id] or "Error" in state["tasks"][track_id]:
-                        continue
-                        
-                    t = ripper.download_manager.get_task(track_id)
-                    if t:
-                        if t.status == Status.FAILED:
-                            if t.error:
-                                new_val = f"[{track_id[-4:]}] Error ({t.error})"
-                            else:
-                                new_val = f"[{track_id[-4:]}] Error"
-                        else:
-                            title = t.metadata.title if t.metadata else 'Unknown'
-                            new_val = f"[{track_id[-4:]}] {title} : {t.status.value}"
-                        
-                        if state["tasks"].get(track_id) != new_val:
-                            state["tasks"][track_id] = new_val
-                    else:
-                        # Task is unrecorded (likely unregistered from the queue after finishing download)
-                        # We should not display stale status like DECRYPTING
-                        current_status = state["tasks"].get(track_id, "")
-                        if "QUEUED" not in current_status:
-                            parts = current_status.rsplit(":", 1)
-                            prefix = parts[0].strip() if len(parts) > 1 else f"[{track_id[-4:]}] Unknown"
-                            new_val = f"{prefix} : Pending Upload \u23F3"
-                            if state["tasks"].get(track_id) != new_val:
-                                state["tasks"][track_id] = new_val
-                            
-                text = "Active Tasks:\n" + "\n".join(state["tasks"].values())
-                if text != state["last_text"]:
-                    try:
-                        await context.bot.edit_message_text(text[:4000], chat_id=msg.chat_id, message_id=msg.message_id)
-                        state["last_text"] = text
-                    except Exception:
-                        pass
-        finally:
-            pass
-
-    loop_task = asyncio.create_task(update_loop())
-
-    flags = Flags(force_save=force_download, language=language)
-
-    completed_event = asyncio.Event()
-
-    async def on_all_done():
-        completed_event.set()
-
-    upload_event = asyncio.Event()
-    pending_uploads = 0
-
-    def make_on_start(s_id):
-        async def on_s():
-            current = state["tasks"].get(s_id, "")
-            parts = current.rsplit(":", 1)
-            prefix = parts[0].strip() if len(parts) > 1 else f"[{s_id[-4:]}] Unknown"
-            state["tasks"][s_id] = f"{prefix} : Uploading \u2B06"
-
-        return on_s
-
-    def make_on_done(s_id):
-        async def on_d(success: bool, warning=None):
-            nonlocal pending_uploads
-            current = state["tasks"].get(s_id, "")
-            parts = current.rsplit(":", 1)
-            prefix = parts[0].strip() if len(parts) > 1 else f"[{s_id[-4:]}] Unknown"
-            if success:
-                if warning:
-                    state["tasks"][s_id] = f"{prefix} : Finished ({warning})"
-                else:
-                    state["tasks"][s_id] = f"{prefix} : Finished"
-            else:
-                if warning:
-                    state["tasks"][s_id] = f"{prefix} : Error ({warning})"
-                else:
-                    state["tasks"][s_id] = f"{prefix} : Error"
-
-            pending_uploads -= 1
-            if pending_uploads <= 0:
-                upload_event.set()
-
-        return on_d
-
-    # Process each song eagerly validated
-    async def process_song(song_id: str, storefront: str, p_index=None):
-        if not force_download:
-            file_id = await user_db.get_cache(song_id, codec, language, loose_cache)
-            if file_id:
-                state["tasks"][song_id] = f"[{song_id[-4:]}] Cached \u26A1"
-                await upload_worker.enqueue(UploadTask(
-                    chat_id=msg.chat_id,
-                    filename=None,
-                    message_id=msg.message_id,
-                    cached_file_id=file_id
-                ))
-                return True
-
-        state["tasks"][song_id] = f"[{song_id[-4:]}] QUEUED"
-        telegram_tasks_listeners[song_id].append({
-            "chat_id": update.effective_chat.id,
-            "message_id": msg.message_id,
-            "codec": codec,
-            "language": language,
-            "on_upload_start": make_on_start(song_id),
-            "on_upload_done": make_on_done(song_id)
-        })
-        return False
-
-    actual_songs_to_rip = []
-    for song_obj, p_index in songs_to_rip:
-        is_cached = await process_song(song_obj.id, song_obj.storefront, p_index)
-        if not is_cached:
-            actual_songs_to_rip.append((song_obj, p_index))
-
-    parent_done = ParentDoneHandler(len(actual_songs_to_rip) if actual_songs_to_rip else 1, on_all_done)
-
-    pending_uploads = len(actual_songs_to_rip)
-    if pending_uploads == 0:
-        upload_event.set()
-
-    # Spawn Rip Tasks
-    if actual_songs_to_rip:
-        for song_obj, p_index in actual_songs_to_rip:
-            safely_create_task(ripper.rip_song(song_obj, codec, flags, parent_done=parent_done, playlist=p_index, timeout_sec=bot_config.limits.task_timeout_sec))
-    else:
-        # Everything was cached
-        completed_event.set()
-
-    # Wait for completion
     try:
-        await completed_event.wait()
-        await upload_event.wait()
-    finally:
-        state["done"] = True
-        loop_task.cancel()
+        songs_to_rip = await _collect_tracks(url_obj, job.language)
+    except Exception as exc:
+        result = BotJobResult(job_id=job.job_id, request_type=job.request_type, request_url=job.request_url, total_count=1, success_count=0, failed_count=1, failed_songs=[SongProcessResult(song_id=url_obj.id, title=url_obj.id, artist='', album='', source_url=job.request_url, status='failed', error_message=str(exc))])
+        await send_job_summary(app.bot, job, result)
+        return
 
-    # Final Update
-    text = "All requested tasks completed.\n\nFinal Status:\n" + "\n".join(state["tasks"].values())
-    try:
-        await context.bot.edit_message_text(text[:4000], chat_id=msg.chat_id, message_id=msg.message_id)
-    except Exception:
-        pass
+    ripper = app.bot_data['ripper']
+    flags = Flags(force_save=job.force_download, language=job.language)
+    results = []
+    for song_obj, playlist in songs_to_rip:
+        task = await ripper.rip_song(song_obj, job.codec, flags, playlist=playlist, timeout_sec=bot_config.limits.task_timeout_sec)
+        results.append(_task_to_song_result(task, song_obj))
+
+    job.song_results = results
+    summary = _build_job_result(job, results)
+    await send_job_summary(app.bot, job, summary)

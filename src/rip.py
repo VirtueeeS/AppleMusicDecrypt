@@ -20,6 +20,7 @@ from src.models import PlaylistInfo
 from src.mp4 import extract_media, extract_song, encapsulate, write_metadata, fix_encapsulate, fix_esds_box, \
     check_song_integrity
 from src.save import save
+from src.upload.service import UploadService, cleanup_local_files
 from src.task import Task, Status
 from src.types import Codec, ParentDoneHandler
 from src.url import Song, Album, URLType, Playlist
@@ -50,6 +51,28 @@ class DownloadManager:
 class Ripper:
     def __init__(self):
         self.download_manager = DownloadManager()
+        self.upload_service = UploadService() if it(Config).upload.enable else None
+
+    async def _finalize_output(self, task: Task, song_bytes: bytes, local_codec: str):
+        task.saved_files = await run_sync(save, song_bytes, local_codec, task.metadata, task.playlist)
+        task.logger.saved()
+        if self.upload_service and it(Config).upload.enable:
+            task.logger.logger.info("Uploading artifacts to remote storage...")
+            task.upload_result = await run_sync(self.upload_service.upload, task.saved_files)
+            if not task.upload_result.success:
+                task.update_status(Status.FAILED)
+                task.error = Exception(task.upload_result.error_message or "Upload failed")
+                return False
+            if it(Config).upload.deleteLocalAfterUpload:
+                try:
+                    await run_sync(cleanup_local_files, task.saved_files)
+                except Exception as cleanup_error:
+                    task.logger.logger.warning(f"Cleanup failed after upload: {cleanup_error}")
+        if it(Config).download.afterDownloaded:
+            command = it(Config).download.afterDownloaded.format(filename=task.saved_files.audio_path)
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        task.update_status(Status.DONE)
+        return True
 
     async def rip_song(self, url: Song, codec: str, flags: Flags = Flags(),
                        parent_done: ParentDoneHandler = None, playlist: PlaylistInfo = None,
@@ -61,7 +84,7 @@ class Ripper:
                 await parent_done.try_done()
             return
 
-        task = Task(adamId=url.id, parentDone=parent_done, playlist=playlist)
+        task = Task(adamId=url.id, parentDone=parent_done, playlist=playlist, source_url=url.url)
 
         # Initialize Logger
         task.logger = RipLogger(URLType.Song, task.adamId)
@@ -90,7 +113,7 @@ class Ripper:
                 task.logger.not_exist()
                 task.update_status(Status.FAILED)
                 task.error = Exception("Song not found on Apple Music")
-                return
+                return task
 
             # Get Cover and Lyrics
             task.metadata.cover = await it(WebAPI).get_cover(task.metadata.cover_url,
@@ -104,10 +127,10 @@ class Ripper:
                 task.metadata.set_playlist_index(playlist.songIdIndexMapping.get(url.id))
 
             # Check Local Existence
-            if not flags.force_save and check_song_exists(task.metadata, codec, playlist):
+            if not it(Config).upload.enable and not flags.force_save and check_song_exists(task.metadata, codec, playlist):
                 task.logger.already_exist()
                 task.update_status(Status.DONE)
-                return
+                return task
 
             # Get M3U8
             m3u8_url = await self._get_m3u8_url(task, codec, raw_metadata)
@@ -116,13 +139,13 @@ class Ripper:
                     it(Config).download.codecAlternative and not raw_metadata.attributes.extendedAssetUrls.enhancedHls and Codec.AAC_LEGACY in it(
                     Config).download.codecPriority):
                 await self._rip_song_legacy(task, timeout_sec)
-                return
+                return task
 
             if not m3u8_url:
                 task.logger.logger.error("Lossless audio does not exist")
                 task.update_status(Status.FAILED)
                 task.error = Exception("Lossless audio does not exist")
-                return
+                return task
 
             try:
                 task.m3u8Info = await extract_media(m3u8_url, codec, task)
@@ -130,13 +153,13 @@ class Ripper:
                 task.logger.audio_not_exist()
                 task.update_status(Status.FAILED)
                 task.error = CodecNotFoundException(f"Audio codec '{codec}' not found")
-                return
+                return task
 
             task.logger.selected_codec(task.m3u8Info.codec_id)
             if all([bool(task.m3u8Info.bit_depth), bool(task.m3u8Info.sample_rate)]):
                 task.metadata.set_bit_depth_and_sample_rate(task.m3u8Info.bit_depth, task.m3u8Info.sample_rate)
                 # Check existence again with precise metadata
-                if not flags.force_save and check_song_exists(task.metadata, codec, playlist):
+                if not it(Config).upload.enable and not flags.force_save and check_song_exists(task.metadata, codec, playlist):
                     task.logger.already_exist()
                     task.update_status(Status.DONE)
                     return
@@ -201,13 +224,9 @@ class Ripper:
                             task.logger.failed_integrity(False)
                             task.error = SongNotPassIntegrityCheckException("Integrity Check Warning")
         
-                    local_filename = await run_sync(save, song_bytes, local_codec, task.metadata, task.playlist)
-                    task.logger.saved()
-                    task.update_status(Status.DONE)
-        
-                    if it(Config).download.afterDownloaded:
-                        command = it(Config).download.afterDownloaded.format(filename=local_filename)
-                        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    finalized = await self._finalize_output(task, song_bytes, local_codec)
+                    if not finalized:
+                        return
                 
                 if timeout_sec > 0:
                     await asyncio.wait_for(_phase2(), timeout=timeout_sec)
@@ -230,9 +249,11 @@ class Ripper:
             raise
         finally:
             await self.download_manager.unregister_task(task)
-            task.update_status(task.status)  # Ensure status is set
+            task.update_status(task.status)
             if task.parentDone:
                 await task.parentDone.try_done()
+
+        return task
 
     async def _get_m3u8_url(self, task: Task, codec: str, raw_metadata) -> Optional[str]:
         if not raw_metadata.attributes.extendedAssetUrls:
@@ -275,13 +296,9 @@ class Ripper:
                     if not await run_sync(check_song_integrity, song_bytes):
                         task.logger.failed_integrity(True)
         
-                    local_filename = await run_sync(save, song_bytes, Codec.AAC_LEGACY, task.metadata, task.playlist)
-                    task.logger.saved()
-                    task.update_status(Status.DONE)
-        
-                    if it(Config).download.afterDownloaded:
-                        command = it(Config).download.afterDownloaded.format(filename=local_filename)
-                        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    finalized = await self._finalize_output(task, song_bytes, Codec.AAC_LEGACY)
+                    if not finalized:
+                        return
 
                 if timeout_sec > 0:
                     await asyncio.wait_for(_phase2(), timeout=timeout_sec)

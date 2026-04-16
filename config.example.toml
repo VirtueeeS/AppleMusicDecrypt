@@ -119,3 +119,25 @@ maxWaitTime = 30
 embedMetadata = ["title", "artist", "album", "album_artist", "composer", "album_created",
     "genre", "created", "tracknum", "disk", "lyrics", "cover", "copyright",
     "record_company", "upc", "isrc", "rtng", "song_id", "album_id", "artist_id"]
+
+
+[upload]
+enable = false
+provider = "webdav"
+tempDir = "tmp_upload"
+deleteLocalAfterUpload = true
+
+[upload.webdav]
+url = "http://127.0.0.1:5244/dav"
+username = ""
+password = ""
+basePath = "/"
+timeout = 120
+
+[upload.openlist]
+url = "http://127.0.0.1:5244"
+username = ""
+password = ""
+token = ""
+basePath = "/"
+timeout = 120

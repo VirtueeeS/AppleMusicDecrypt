@@ -3,7 +3,7 @@ from typing import Type
 
 from creart import exists_module
 from creart.creator import AbstractCreator, CreateTargetInfo
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 CONFIG_VERSION = "0.0.10"
 
@@ -61,13 +61,40 @@ class Metadata(BaseModel):
                                 "record_company", "upc", "isrc", "rtng"]
 
 
+class UploadWebDAV(BaseModel):
+    url: str = ""
+    username: str = ""
+    password: str = ""
+    basePath: str = "/"
+    timeout: int = 120
+
+
+class UploadOpenList(BaseModel):
+    url: str = ""
+    username: str = ""
+    password: str = ""
+    token: str = ""
+    basePath: str = "/"
+    timeout: int = 120
+
+
+class Upload(BaseModel):
+    enable: bool = False
+    provider: str = "webdav"
+    tempDir: str = "tmp_upload"
+    deleteLocalAfterUpload: bool = True
+    webdav: UploadWebDAV = Field(default_factory=UploadWebDAV)
+    openlist: UploadOpenList = Field(default_factory=UploadOpenList)
+
+
 class Config(BaseModel):
     version: str = "0.0.0"
-    region: Region
-    instance: Instance
-    localInstance: LocalInstance
-    download: Download
-    metadata: Metadata
+    region: Region = Field(default_factory=Region)
+    instance: Instance = Field(default_factory=Instance)
+    localInstance: LocalInstance = Field(default_factory=LocalInstance)
+    download: Download = Field(default_factory=Download)
+    metadata: Metadata = Field(default_factory=Metadata)
+    upload: Upload = Field(default_factory=Upload)
 
     @classmethod
     def load_from_config(cls, config_file: str = "config.toml"):

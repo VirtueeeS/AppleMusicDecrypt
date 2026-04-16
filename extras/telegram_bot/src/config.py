@@ -2,7 +2,7 @@ import os
 import tomllib
 from typing import List
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 CURRENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(CURRENT_DIR, "config.toml")
@@ -18,6 +18,11 @@ class SystemSettings(BaseModel):
     loose_cache: bool = True
     whitelist_mode: bool = False
     admin_ids: List[int] = []
+
+
+class QueueSettings(BaseModel):
+    max_size: int = 20
+
 
 class LimitsSettings(BaseModel):
     max_tasks_per_user: int = 10
@@ -35,10 +40,11 @@ class UserDefaultSettings(BaseModel):
 
 
 class TelegramBotConfig(BaseModel):
-    bot: BotSettings
-    system: SystemSettings
-    limits: LimitsSettings
-    user_default: UserDefaultSettings
+    bot: BotSettings = Field(default_factory=BotSettings)
+    system: SystemSettings = Field(default_factory=SystemSettings)
+    queue: QueueSettings = Field(default_factory=QueueSettings)
+    limits: LimitsSettings = Field(default_factory=LimitsSettings)
+    user_default: UserDefaultSettings = Field(default_factory=UserDefaultSettings)
 
     @classmethod
     def load_from_config(cls, config_file: str = CONFIG_PATH):
